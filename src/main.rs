@@ -165,7 +165,7 @@ impl BlackjackDealerPredictiveModel {
             / (self.row_totals[row_index] as f64)
     }
 
-    pub fn simulate(&mut self, iterations: u32) {
+    pub fn simulate(&mut self, iterations: u64) {
         let mut hand = BlackjackDealerHandView::new(&mut self.rng, &mut self.deck);
         for _ in 0..iterations {
             let card = hand.draw();
@@ -324,16 +324,17 @@ impl<'a> PlayerOptimizer<'a> {
                 let mut total = 0.0;
                 for card_value in CardValue::VALUES {
                     let prob = self.cards.remove(card_value);
-                    total +=
-                        prob * recurse(
-                            self,
-                            your_hand.clone().add_card(card_value),
-                            BlackjackMove::Stay,
-                        )
-                        .1 + self.base_fee_fraction;
+                    total += prob
+                        * (2.0
+                            * recurse(
+                                self,
+                                your_hand.clone().add_card(card_value),
+                                BlackjackMove::Stay,
+                            )
+                            .1);
                     self.cards.add(card_value);
                 }
-                (bj_move, total)
+                (bj_move, total + self.base_fee_fraction)
             }
         }
     }
@@ -471,6 +472,19 @@ impl CompressedDeck {
 }
 
 fn main_wrapper() -> Option<()> {
+    let stdin = std::io::stdin();
+    let mut stdin_iterator = stdin.lock().lines();
+    let mut read_line = move || -> Option<String> {
+        let line = stdin_iterator.next();
+        match line {
+            None => {
+                println!("No more input. Terminating.");
+                None
+            }
+            Some(line) => Some(line.expect("Failed to read line. Terminating.")),
+        }
+    };
+
     let mut deck = standard_deck(8);
     let mut rng = rand::thread_rng();
     for offset in 0..deck.len() {
@@ -481,7 +495,14 @@ fn main_wrapper() -> Option<()> {
     let mut model = BlackjackDealerPredictiveModel::new(&BlackjackDealerHandModelOptions {
         deck: Some(deck.clone()),
     });
-    model.simulate(100000000);
+    let iterations = loop {
+        println!("Please enter a number of iterations to train the simulator: ");
+        match read_line()?.parse::<u64>() {
+            Ok(amount) => break amount,
+            Err(_) => println!("Failed to parse iterations. Try again."),
+        }
+    };
+    model.simulate(iterations);
     let probabilities = model.probabilities();
     let relative_stderrs = model.relative_stderrs();
     for i in 0..10 {
@@ -500,19 +521,6 @@ fn main_wrapper() -> Option<()> {
         println!("{}: {:?}", i + 1, counts);
     }
     let mut optimizer = PlayerOptimizer::new(&model, &deck, 1.0 / 15.0);
-
-    let stdin = std::io::stdin();
-    let mut stdin_iterator = stdin.lock().lines();
-    let mut read_line = move || -> Option<String> {
-        let line = stdin_iterator.next();
-        match line {
-            None => {
-                println!("No more input. Terminating.");
-                None
-            }
-            Some(line) => Some(line.expect("Failed to read line. Terminating.")),
-        }
-    };
 
     loop {
         let dealer_card = loop {
@@ -548,7 +556,7 @@ fn main_wrapper() -> Option<()> {
             Ok(mut move_values) => {
                 println!(
                     "Your best move is {:?}, which has an expected return of {:.3}",
-                    move_values[0].0, move_values[1].1
+                    move_values[0].0, move_values[0].1
                 );
                 for (mv, ret) in &move_values[1..] {
                     println!("{:?} has an expected return of {:.3}", *mv, *ret)
