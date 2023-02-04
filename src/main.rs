@@ -269,7 +269,7 @@ impl<'a> PlayerOptimizer<'a> {
         let your_best_value = your_hand.best_value();
         if your_best_value > 21 {
             return if your_hand.number_of_cards <= 3 && self.dual_bust_protection {
-                let odds_dealer_better_hand = (0..your_best_value)
+                let odds_dealer_better_hand = (0..=your_best_value)
                     .map(|finalh| self.dealer_model.final_probability(dealer_card, finalh))
                     .sum::<f64>();
                 (BlackjackMove::Stay, -self.base_fee_fraction - odds_dealer_better_hand)
@@ -527,7 +527,7 @@ fn main_wrapper() -> Option<()> {
             .collect();
         println!("{}: {:?}", i + 1, counts);
     }
-    let mut optimizer = PlayerOptimizer::new(&model, &deck, 0.0 / 15.0, false);
+    let mut optimizer = PlayerOptimizer::new(&model, &deck, 0.0 / 15.0, true);
 
     loop {
         let dealer_card = loop {
