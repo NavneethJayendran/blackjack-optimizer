@@ -17,12 +17,14 @@ pub struct BlackjackDealerPredictiveModel {
 
 #[derive(Clone, Copy, Default)]
 pub struct BlackjackHand {
+    number_of_cards: u32,
     number_of_aces: u32,
     non_ace_value: u32,
 }
 
 impl BlackjackHand {
     fn add_card(&mut self, card: CardValue) -> BlackjackHand {
+        self.number_of_cards += 1;
         if let Some(value) = card.value() {
             self.non_ace_value += value;
         } else {
@@ -203,6 +205,7 @@ enum BlackjackMove {
 pub struct PlayerOptimizer<'a> {
     dealer_model: &'a BlackjackDealerPredictiveModel,
     base_fee_fraction: f64,
+    dual_bust_protection: bool,
     cards: CompressedDeck,
 }
 
@@ -211,10 +214,12 @@ impl<'a> PlayerOptimizer<'a> {
         dealer_model: &'a BlackjackDealerPredictiveModel,
         deck: &Vec<Card>,
         base_fee_fraction: f64,
+        dual_bust_protection: bool,
     ) -> PlayerOptimizer<'a> {
         PlayerOptimizer {
             dealer_model,
             base_fee_fraction,
+            dual_bust_protection,
             cards: CompressedDeck::new(deck.iter().map(|card| CardValue::from(*card))),
         }
     }
@@ -241,11 +246,10 @@ impl<'a> PlayerOptimizer<'a> {
             }
             your_hand.add_card((*card).into());
         }
-        let can_double = your_cards.len() == 1;
         let mut out: Vec<(BlackjackMove, f64)> = [Stay, Hit, Double]
             .iter()
-            .filter(|mv| **mv != Double || can_double)
-            .map(|mv| self.expected_return(can_double, your_hand, dealer_card, *mv))
+            .map(|mv| self.expected_return(your_hand, dealer_card, *mv))
+            .filter(|(_, expected_return)| *expected_return > f64::NEG_INFINITY)
             .collect();
         out.sort_by(|(_, a), (_, b)| a.total_cmp(b).reverse());
 
@@ -258,36 +262,29 @@ impl<'a> PlayerOptimizer<'a> {
 
     fn expected_return(
         &mut self,
-        can_double: bool,
         your_hand: BlackjackHand,
         dealer_card: Card,
         bj_move: BlackjackMove,
     ) -> (BlackjackMove, f64) {
         let your_best_value = your_hand.best_value();
         if your_best_value > 21 {
-            return (
-                BlackjackMove::Stay,
-                -self.base_fee_fraction
-                    - (0..your_best_value)
-                        .map(|finalh| self.dealer_model.final_probability(dealer_card, finalh))
-                        .sum::<f64>(),
-            );
+            return if your_hand.number_of_cards <= 3 && self.dual_bust_protection {
+                let odds_dealer_better_hand = (0..=your_best_value)
+                    .map(|finalh| self.dealer_model.final_probability(dealer_card, finalh))
+                    .sum::<f64>();
+                (BlackjackMove::Stay, -self.base_fee_fraction - odds_dealer_better_hand)
+            } else {
+                (BlackjackMove::Stay, -self.base_fee_fraction - 1.0)
+            }
         }
         let recurse = |selfv: &mut Self, your_hand, bj_move| {
-            selfv.expected_return(false, your_hand, dealer_card, bj_move)
-        };
-        let flat_recurse = |selfv: &mut Self, bj_move| {
-            selfv.expected_return(can_double, your_hand, dealer_card, bj_move)
+            selfv.expected_return(your_hand, dealer_card, bj_move)
         };
         match bj_move {
             BlackjackMove::Optimal => *(vec![
-                flat_recurse(self, BlackjackMove::Stay),
-                flat_recurse(self, BlackjackMove::Hit),
-                if can_double {
-                    recurse(self, your_hand, BlackjackMove::Double)
-                } else {
-                    (BlackjackMove::Double, f64::NEG_INFINITY)
-                },
+                recurse(self, your_hand, BlackjackMove::Stay),
+                recurse(self, your_hand, BlackjackMove::Hit),
+                recurse(self, your_hand, BlackjackMove::Double)
             ]
             .iter()
             .max_by(|a, b| a.1.total_cmp(&b.1)))
@@ -308,6 +305,12 @@ impl<'a> PlayerOptimizer<'a> {
                 (bj_move, total)
             }
             BlackjackMove::Stay => {
+                let can_stay = your_hand.number_of_cards >= 2;
+                if !can_stay {
+                    return (BlackjackMove::Stay, f64::NEG_INFINITY);
+                }
+                let natural_blackjack = your_hand.number_of_cards == 2 && your_best_value == 21;
+                let payout_ratio: f64 = if natural_blackjack { 1.5 } else {1.0};
                 let prob_loss: f64 = (your_best_value + 1..=21)
                     .map(|final_dealer_best_value| {
                         self.dealer_model
@@ -318,9 +321,13 @@ impl<'a> PlayerOptimizer<'a> {
                     .dealer_model
                     .final_probability(dealer_card, your_best_value);
                 let prob_win = 1.0 - prob_tie - prob_loss;
-                (bj_move, prob_win - prob_loss - self.base_fee_fraction)
+                (bj_move, payout_ratio * prob_win - prob_loss - self.base_fee_fraction)
             }
             BlackjackMove::Double => {
+                let can_double = your_hand.number_of_cards == 2;
+                if !can_double {
+                    return (BlackjackMove::Double, f64::NEG_INFINITY);
+                }
                 let mut total = 0.0;
                 for card_value in CardValue::VALUES {
                     let prob = self.cards.remove(card_value);
@@ -520,7 +527,7 @@ fn main_wrapper() -> Option<()> {
             .collect();
         println!("{}: {:?}", i + 1, counts);
     }
-    let mut optimizer = PlayerOptimizer::new(&model, &deck, 1.0 / 15.0);
+    let mut optimizer = PlayerOptimizer::new(&model, &deck, 0.0 / 15.0, true);
 
     loop {
         let dealer_card = loop {
@@ -533,16 +540,10 @@ fn main_wrapper() -> Option<()> {
         };
 
         let mut your_cards = vec![];
+        println!("Keep entering cards for you to draw from the deck, or just hit enter to run the optimizer.");
         loop {
-            if your_cards.is_empty() {
-                println!("Enter a card for you to draw from the deck: ");
-            } else {
-                println!(
-                    "Enter a card for you to draw from the deck, or just hit enter to run the optimizer:"
-                );
-            }
             let input = read_line()?;
-            if !your_cards.is_empty() && input.is_empty() {
+            if input.is_empty() {
                 break;
             }
             let attempt: Result<Card, _> = serde_json::from_str(&format!("\"{input}\""));
@@ -566,6 +567,7 @@ fn main_wrapper() -> Option<()> {
                 println!("{e}");
             }
         }
+        println!("");
     }
 }
 
