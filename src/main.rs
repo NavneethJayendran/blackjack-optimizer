@@ -20,16 +20,19 @@ pub struct BlackjackHand {
     number_of_cards: u32,
     number_of_aces: u32,
     non_ace_value: u32,
+    last_two_cards: [Option<Card>; 2],
 }
 
 impl BlackjackHand {
-    fn add_card(&mut self, card: CardValue) -> BlackjackHand {
+    fn add_card(&mut self, card: Card) -> BlackjackHand {
         self.number_of_cards += 1;
         if let Some(value) = card.value() {
             self.non_ace_value += value;
         } else {
             self.number_of_aces += 1;
         }
+        self.last_two_cards[1] = self.last_two_cards[0];
+        self.last_two_cards[0] = Some(card);
         self.clone()
     }
 
@@ -38,6 +41,18 @@ impl BlackjackHand {
         let remainder_to_21 = max(0, 21 - (minimum_hand_value as i32)) as u32;
         let best_card_promotions_count = min(remainder_to_21 / 10, self.number_of_aces);
         minimum_hand_value + 10 * best_card_promotions_count
+    }
+
+    fn is_matching_pair(&self) -> bool {
+        self.number_of_cards == 2
+            && match self.last_two_cards {
+                [Some(x), Some(y)] => x == y,
+                _ => false,
+            }
+    }
+
+    fn is_natural_21(&self) -> bool {
+        self.number_of_cards == 2 && self.best_value() == 21
     }
 }
 
@@ -220,7 +235,7 @@ impl<'a> PlayerOptimizer<'a> {
             dealer_model,
             base_fee_fraction,
             dual_bust_protection,
-            cards: CompressedDeck::new(deck.iter().map(|card| CardValue::from(*card))),
+            cards: CompressedDeck::new(deck.iter().map(|card| Card::from(*card))),
         }
     }
 
@@ -272,10 +287,13 @@ impl<'a> PlayerOptimizer<'a> {
                 let odds_dealer_better_hand = (0..=your_best_value)
                     .map(|finalh| self.dealer_model.final_probability(dealer_card, finalh))
                     .sum::<f64>();
-                (BlackjackMove::Stay, -self.base_fee_fraction - odds_dealer_better_hand)
+                (
+                    BlackjackMove::Stay,
+                    -self.base_fee_fraction - odds_dealer_better_hand,
+                )
             } else {
                 (BlackjackMove::Stay, -self.base_fee_fraction - 1.0)
-            }
+            };
         }
         let recurse = |selfv: &mut Self, your_hand, bj_move| {
             selfv.expected_return(your_hand, dealer_card, bj_move)
@@ -284,14 +302,14 @@ impl<'a> PlayerOptimizer<'a> {
             BlackjackMove::Optimal => *(vec![
                 recurse(self, your_hand, BlackjackMove::Stay),
                 recurse(self, your_hand, BlackjackMove::Hit),
-                recurse(self, your_hand, BlackjackMove::Double)
+                recurse(self, your_hand, BlackjackMove::Double),
             ]
             .iter()
             .max_by(|a, b| a.1.total_cmp(&b.1)))
             .unwrap(),
             BlackjackMove::Hit => {
                 let mut total = 0.0;
-                for card_value in CardValue::VALUES {
+                for card_value in Card::VALUES {
                     let prob = self.cards.remove(card_value);
                     total += prob
                         * recurse(
@@ -309,8 +327,7 @@ impl<'a> PlayerOptimizer<'a> {
                 if !can_stay {
                     return (BlackjackMove::Stay, f64::NEG_INFINITY);
                 }
-                let natural_blackjack = your_hand.number_of_cards == 2 && your_best_value == 21;
-                let payout_ratio: f64 = if natural_blackjack { 1.5 } else {1.0};
+                let payout_ratio: f64 = if your_hand.is_natural_21() { 1.5 } else { 1.0 };
                 let prob_loss: f64 = (your_best_value + 1..=21)
                     .map(|final_dealer_best_value| {
                         self.dealer_model
@@ -321,7 +338,10 @@ impl<'a> PlayerOptimizer<'a> {
                     .dealer_model
                     .final_probability(dealer_card, your_best_value);
                 let prob_win = 1.0 - prob_tie - prob_loss;
-                (bj_move, payout_ratio * prob_win - prob_loss - self.base_fee_fraction)
+                (
+                    bj_move,
+                    payout_ratio * prob_win - prob_loss - self.base_fee_fraction,
+                )
             }
             BlackjackMove::Double => {
                 let can_double = your_hand.number_of_cards == 2;
@@ -329,7 +349,7 @@ impl<'a> PlayerOptimizer<'a> {
                     return (BlackjackMove::Double, f64::NEG_INFINITY);
                 }
                 let mut total = 0.0;
-                for card_value in CardValue::VALUES {
+                for card_value in Card::VALUES {
                     let prob = self.cards.remove(card_value);
                     total += prob
                         * (2.0
@@ -365,6 +385,22 @@ pub enum Card {
 }
 
 impl Card {
+    const VALUES: [Self; 13] = [
+        Card::Ace,
+        Card::Two,
+        Card::Three,
+        Card::Four,
+        Card::Five,
+        Card::Six,
+        Card::Seven,
+        Card::Eight,
+        Card::Nine,
+        Card::Ten,
+        Card::Jack,
+        Card::Queen,
+        Card::King,
+    ];
+
     fn value(&self) -> Option<u32> {
         CardValue::from(*self).value()
     }
@@ -385,19 +421,6 @@ pub enum CardValue {
 }
 
 impl CardValue {
-    const VALUES: [Self; 10] = [
-        CardValue::Ace,
-        CardValue::Two,
-        CardValue::Three,
-        CardValue::Four,
-        CardValue::Five,
-        CardValue::Six,
-        CardValue::Seven,
-        CardValue::Eight,
-        CardValue::Nine,
-        CardValue::Ten,
-    ];
-
     fn value(&self) -> Option<u32> {
         use CardValue::*;
         match *self {
@@ -441,11 +464,11 @@ pub enum BasicError {
 
 struct CompressedDeck {
     total: u64,
-    counts: HashMap<CardValue, u64>,
+    counts: HashMap<Card, u64>,
 }
 
 impl CompressedDeck {
-    fn new<CardsT: Iterator<Item = CardValue>>(cards: CardsT) -> Self {
+    fn new<CardsT: Iterator<Item = Card>>(cards: CardsT) -> Self {
         let mut out = CompressedDeck {
             total: 0,
             counts: HashMap::new(),
@@ -456,16 +479,16 @@ impl CompressedDeck {
         out
     }
 
-    fn prob(&self, card_value: CardValue) -> f64 {
+    fn prob(&self, card_value: Card) -> f64 {
         (*self.counts.get(&card_value).unwrap_or(&0) as f64) / (self.total as f64)
     }
 
-    fn add(&mut self, card_value: CardValue) {
+    fn add(&mut self, card_value: Card) {
         *self.counts.entry(card_value.clone()).or_insert(0) += 1;
         self.total += 1;
     }
 
-    fn remove(&mut self, card_value: CardValue) -> f64 {
+    fn remove(&mut self, card_value: Card) -> f64 {
         match self.counts.entry(card_value).or_insert(0) {
             &mut 0 => 0.0,
             amount => {
