@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::vec;
 use thiserror::Error;
+use toml;
 
 pub struct BlackjackDealerPredictiveModel {
     // map from starting card value (Ace is index 0) to instances of given final dealer hand values
@@ -518,7 +519,21 @@ impl CompressedDeck {
     }
 }
 
-fn main_wrapper() -> Option<()> {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct Config {
+    dealer_training_iterations: Option<u64>,
+    blackjack_payout_ratio: Option<f64>,
+    base_fee_fraction: Option<f64>,
+    dual_bust_protection: Option<bool>,
+}
+
+fn main_wrapper(config_file: Option<&str>) -> Option<()> {
+    let config_file_contents = config_file.map_or(String::default(), |file| {
+        std::fs::read_to_string(file).expect("Should be able to read config file")
+    });
+    let config: Config =
+        toml::from_str(&config_file_contents[..]).expect("Should be able to parse config file");
+
     let stdin = std::io::stdin();
     let mut stdin_iterator = stdin.lock().lines();
     let mut read_line = move || -> Option<String> {
@@ -542,14 +557,49 @@ fn main_wrapper() -> Option<()> {
     let mut model = BlackjackDealerPredictiveModel::new(&BlackjackDealerHandModelOptions {
         deck: Some(deck.clone()),
     });
-    let iterations = loop {
-        println!("Please enter a number of iterations to train the dealer simulator: ");
-        match read_line()?.parse::<u64>() {
-            Ok(amount) => break amount,
-            Err(_) => println!("Failed to parse iterations. Try again."),
-        }
+    let dealer_training_iterations = match config.dealer_training_iterations {
+        Some(value) => value,
+        None => loop {
+            println!("Please enter a number of iterations to train the simulator:");
+            match read_line()?.parse::<u64>() {
+                Ok(amount) => break amount,
+                Err(_) => println!("Failed to parse iterations. Try again."),
+            }
+        },
     };
-    model.simulate(iterations);
+    let base_fee_fraction = match config.base_fee_fraction {
+        Some(value) => value,
+        None => loop {
+            println!("Please enter a base fee fraction (non-negative, finite decimal):");
+            match read_line()?.parse::<f64>() {
+                Ok(fraction) if fraction >= 0.0 && fraction != f64::INFINITY => break fraction,
+                Ok(_) => println!("Fraction must be finite and non-negative. Try again."),
+                Err(_) => println!("Failed to parse base fee fraction. Try again."),
+            }
+        },
+    };
+    let dual_bust_protection = match config.dual_bust_protection {
+        Some(value) => value,
+        None => loop {
+            println!("Please enter whether to enable dual bust protection:");
+            match read_line()?.to_lowercase().parse::<bool>() {
+                Ok(value) => break value,
+                Err(_) => println!("Answer must be true or false. Try again."),
+            }
+        },
+    };
+    let blackjack_payout_ratio = match config.blackjack_payout_ratio {
+        Some(value) => value,
+        None => loop {
+            println!("Please enter the player payout ratio for blackjack:");
+            match read_line()?.to_lowercase().parse::<f64>() {
+                Ok(ratio) if ratio >= 1.0 && ratio != f64::INFINITY => break ratio,
+                Ok(_) => println!("Payout ratio must be finite and greater than 1.0. Try again."),
+                Err(_) => println!("Failed to parse player payout ratio for blackjack. Try again."),
+            };
+        },
+    };
+    model.simulate(dealer_training_iterations);
     let probabilities = model.probabilities();
     let relative_stderrs = model.relative_stderrs();
     for i in 0..10 {
@@ -567,7 +617,13 @@ fn main_wrapper() -> Option<()> {
             .collect();
         println!("{}: {:?}", i + 1, counts);
     }
-    let mut optimizer = PlayerOptimizer::new(&model, &deck, 6.0 / 5.0, 0.0 / 15.0, true);
+    let mut optimizer = PlayerOptimizer::new(
+        &model,
+        &deck,
+        blackjack_payout_ratio,
+        base_fee_fraction,
+        dual_bust_protection,
+    );
 
     loop {
         let dealer_card = loop {
@@ -625,7 +681,20 @@ fn main_wrapper() -> Option<()> {
 }
 
 fn main() {
-    main_wrapper();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut config_file: Option<&str> = None;
+    let mut iter = args.iter();
+    loop {
+        let arg = match iter.next() {
+            Some(arg) => arg,
+            None => break,
+        };
+        match &arg[..] {
+            "--config" | "-c" => config_file = Some(iter.next().expect("Expected config filename")),
+            other => panic!("Unexpected argument {other}"),
+        };
+    }
+    main_wrapper(config_file);
 }
 
 #[cfg(test)]
