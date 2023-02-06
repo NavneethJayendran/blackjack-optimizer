@@ -525,6 +525,7 @@ struct Config {
     blackjack_payout_ratio: Option<f64>,
     base_fee_fraction: Option<f64>,
     dual_bust_protection: Option<bool>,
+    print_dealer_table: Option<bool>,
 }
 
 fn main_wrapper(config_file: Option<&str>) -> Option<()> {
@@ -600,22 +601,24 @@ fn main_wrapper(config_file: Option<&str>) -> Option<()> {
         },
     };
     model.simulate(dealer_training_iterations);
-    let probabilities = model.probabilities();
-    let relative_stderrs = model.relative_stderrs();
-    for i in 0..10 {
-        let counts: Vec<String> = izip!(probabilities[i].iter(), relative_stderrs[i].iter())
-            .enumerate()
-            .filter(|(_, (prob, _))| **prob > 0.0)
-            .map(|(idx, (prob, rel_stderr))| {
-                format!(
-                    "{}:{:.5}+-{:.5}",
-                    idx,
-                    *prob as f64,
-                    (*prob * (1.0 - *prob)).sqrt() * rel_stderr
-                )
-            })
-            .collect();
-        println!("{}: {:?}", i + 1, counts);
+    if config.print_dealer_table.unwrap_or(true) {
+        let probabilities = model.probabilities();
+        let relative_stderrs = model.relative_stderrs();
+        for i in 0..10 {
+            let counts: Vec<String> = izip!(probabilities[i].iter(), relative_stderrs[i].iter())
+                .enumerate()
+                .filter(|(_, (prob, _))| **prob > 0.0)
+                .map(|(idx, (prob, rel_stderr))| {
+                    format!(
+                        "{}:{:.5}+-{:.5}",
+                        idx,
+                        *prob as f64,
+                        (*prob * (1.0 - *prob)).sqrt() * rel_stderr
+                    )
+                })
+                .collect();
+            println!("{}: {:?}", i + 1, counts);
+        }
     }
     let mut optimizer = PlayerOptimizer::new(
         &model,
