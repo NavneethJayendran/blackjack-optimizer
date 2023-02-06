@@ -219,6 +219,7 @@ enum BlackjackMove {
 
 pub struct PlayerOptimizer<'a> {
     dealer_model: &'a BlackjackDealerPredictiveModel,
+    blackjack_payout_ratio: f64,
     base_fee_fraction: f64,
     dual_bust_protection: bool,
     cards: CompressedDeck,
@@ -228,30 +229,32 @@ impl<'a> PlayerOptimizer<'a> {
     fn new(
         dealer_model: &'a BlackjackDealerPredictiveModel,
         deck: &Vec<Card>,
+        blackjack_payout_ratio: f64,
         base_fee_fraction: f64,
         dual_bust_protection: bool,
     ) -> PlayerOptimizer<'a> {
         PlayerOptimizer {
             dealer_model,
+            blackjack_payout_ratio,
             base_fee_fraction,
             dual_bust_protection,
             cards: CompressedDeck::new(deck.iter().map(|card| Card::from(*card))),
         }
     }
 
-    fn best_move(
+    fn best_move_expected_return(
         &mut self,
         your_cards: &Vec<Card>,
-        dealer_card: Card,
+        dealer_card: Option<Card>,
     ) -> Result<Vec<(BlackjackMove, f64)>, BasicError> {
         use BlackjackMove::*;
-        let mut your_hand = BlackjackHand::default();
-        if self.cards.remove(dealer_card.into()) <= 0.0 {
+        if dealer_card.map_or(false, |card| self.cards.remove(card) <= 0.0) {
             return Err(BasicError::NotEnoughCards(format!(
                 "Removed more {:?} cards than present in the deck",
                 dealer_card
             )));
         }
+        let mut your_hand = BlackjackHand::default();
         for card in your_cards {
             if self.cards.remove((*card).into()) <= 0.0 {
                 return Err(BasicError::NotEnoughCards(format!(
@@ -261,18 +264,32 @@ impl<'a> PlayerOptimizer<'a> {
             }
             your_hand.add_card((*card).into());
         }
-        let mut out: Vec<(BlackjackMove, f64)> = [Stay, Hit, Double]
-            .iter()
-            .map(|mv| self.expected_return(your_hand, dealer_card, *mv))
-            .filter(|(_, expected_return)| *expected_return > f64::NEG_INFINITY)
-            .collect();
-        out.sort_by(|(_, a), (_, b)| a.total_cmp(b).reverse());
+        let out = match dealer_card {
+            Some(dealer_card) => {
+                let mut out: Vec<(BlackjackMove, f64)> = [Stay, Hit, Double]
+                    .iter()
+                    .map(|mv| self.expected_return(your_hand, dealer_card, *mv))
+                    .filter(|(_, expected_return)| *expected_return > f64::NEG_INFINITY)
+                    .collect();
+                out.sort_by(|(_, a), (_, b)| a.total_cmp(b).reverse());
 
-        self.cards.add(dealer_card.into());
-        for card in your_cards {
-            self.cards.add((*card).into());
+                self.cards.add(dealer_card);
+                Ok(out)
+            }
+            None => {
+                let mut total = 0.0;
+                for dealer_card in Card::VALUES {
+                    let prob = self.cards.remove(dealer_card);
+                    total += prob * self.expected_return(your_hand, dealer_card, Optimal).1;
+                    self.cards.add(dealer_card);
+                }
+                Ok(vec![(Optimal, total)])
+            }
+        };
+        for your_card in your_cards {
+            self.cards.add(*your_card);
         }
-        Ok(out)
+        out
     }
 
     fn expected_return(
@@ -309,16 +326,16 @@ impl<'a> PlayerOptimizer<'a> {
             .unwrap(),
             BlackjackMove::Hit => {
                 let mut total = 0.0;
-                for card_value in Card::VALUES {
-                    let prob = self.cards.remove(card_value);
+                for card in Card::VALUES {
+                    let prob = self.cards.remove(card);
                     total += prob
                         * recurse(
                             self,
-                            your_hand.clone().add_card(card_value),
+                            your_hand.clone().add_card(card),
                             BlackjackMove::Optimal,
                         )
                         .1;
-                    self.cards.add(card_value);
+                    self.cards.add(card);
                 }
                 (bj_move, total)
             }
@@ -327,7 +344,11 @@ impl<'a> PlayerOptimizer<'a> {
                 if !can_stay {
                     return (BlackjackMove::Stay, f64::NEG_INFINITY);
                 }
-                let payout_ratio: f64 = if your_hand.is_natural_21() { 1.5 } else { 1.0 };
+                let payout_ratio: f64 = if your_hand.is_natural_21() {
+                    self.blackjack_payout_ratio
+                } else {
+                    1.0
+                };
                 let prob_loss: f64 = (your_best_value + 1..=21)
                     .map(|final_dealer_best_value| {
                         self.dealer_model
@@ -349,17 +370,13 @@ impl<'a> PlayerOptimizer<'a> {
                     return (BlackjackMove::Double, f64::NEG_INFINITY);
                 }
                 let mut total = 0.0;
-                for card_value in Card::VALUES {
-                    let prob = self.cards.remove(card_value);
+                for card in Card::VALUES {
+                    let prob = self.cards.remove(card);
                     total += prob
                         * (2.0
-                            * recurse(
-                                self,
-                                your_hand.clone().add_card(card_value),
-                                BlackjackMove::Stay,
-                            )
-                            .1);
-                    self.cards.add(card_value);
+                            * recurse(self, your_hand.clone().add_card(card), BlackjackMove::Stay)
+                                .1);
+                    self.cards.add(card);
                 }
                 (bj_move, total + self.base_fee_fraction)
             }
@@ -479,17 +496,17 @@ impl CompressedDeck {
         out
     }
 
-    fn prob(&self, card_value: Card) -> f64 {
-        (*self.counts.get(&card_value).unwrap_or(&0) as f64) / (self.total as f64)
+    fn prob(&self, card: Card) -> f64 {
+        (*self.counts.get(&card).unwrap_or(&0) as f64) / (self.total as f64)
     }
 
-    fn add(&mut self, card_value: Card) {
-        *self.counts.entry(card_value.clone()).or_insert(0) += 1;
+    fn add(&mut self, card: Card) {
+        *self.counts.entry(card.clone()).or_insert(0) += 1;
         self.total += 1;
     }
 
-    fn remove(&mut self, card_value: Card) -> f64 {
-        match self.counts.entry(card_value).or_insert(0) {
+    fn remove(&mut self, card: Card) -> f64 {
+        match self.counts.entry(card).or_insert(0) {
             &mut 0 => 0.0,
             amount => {
                 let out = (*amount as f64) / (self.total as f64);
@@ -526,7 +543,7 @@ fn main_wrapper() -> Option<()> {
         deck: Some(deck.clone()),
     });
     let iterations = loop {
-        println!("Please enter a number of iterations to train the simulator: ");
+        println!("Please enter a number of iterations to train the dealer simulator: ");
         match read_line()?.parse::<u64>() {
             Ok(amount) => break amount,
             Err(_) => println!("Failed to parse iterations. Try again."),
@@ -550,20 +567,24 @@ fn main_wrapper() -> Option<()> {
             .collect();
         println!("{}: {:?}", i + 1, counts);
     }
-    let mut optimizer = PlayerOptimizer::new(&model, &deck, 0.0 / 15.0, true);
+    let mut optimizer = PlayerOptimizer::new(&model, &deck, 6.0 / 5.0, 0.0 / 15.0, true);
 
     loop {
         let dealer_card = loop {
-            println!("Enter dealer card:");
-            let attempt: Result<Card, _> = serde_json::from_str(&format!("\"{}\"", read_line()?));
+            println!("Enter dealer card, or All to average over all possible cards:");
+            let line = read_line()?;
+            if line.to_uppercase() == "ALL" {
+                break None;
+            }
+            let attempt: Result<Card, _> = serde_json::from_str(&format!("\"{}\"", line));
             match attempt {
-                Ok(card) => break card,
+                Ok(card) => break Some(card),
                 Err(_) => println!("Failed to parse card. Try again."),
             }
         };
 
         let mut your_cards = vec![];
-        println!("Keep entering cards for you to draw from the deck, or just hit enter to run the optimizer.");
+        println!("Keep entering cards for the player to draw from the deck, or just hit enter to run the optimizer.");
         loop {
             let input = read_line()?;
             if input.is_empty() {
@@ -576,8 +597,17 @@ fn main_wrapper() -> Option<()> {
             }
         }
 
-        match optimizer.best_move(&your_cards, dealer_card) {
-            Ok(mut move_values) => {
+        match optimizer
+            .best_move_expected_return(&your_cards, dealer_card)
+            .as_deref()
+        {
+            Ok([(BlackjackMove::Optimal, best_value)]) => {
+                println!(
+                    "Your expected return using the optimal strategy is {:.3}",
+                    best_value
+                )
+            }
+            Ok(move_values) => {
                 println!(
                     "Your best move is {:?}, which has an expected return of {:.3}",
                     move_values[0].0, move_values[0].1
