@@ -542,7 +542,7 @@ fn main_wrapper() -> Option<()> {
         deck: Some(deck.clone()),
     });
     let iterations = loop {
-        println!("Please enter a number of iterations to train the simulator: ");
+        println!("Please enter a number of iterations to train the dealer simulator: ");
         match read_line()?.parse::<u64>() {
             Ok(amount) => break amount,
             Err(_) => println!("Failed to parse iterations. Try again."),
@@ -570,7 +570,7 @@ fn main_wrapper() -> Option<()> {
 
     loop {
         let dealer_card = loop {
-            println!("Enter dealer card:");
+            println!("Enter dealer card, or All to average over all possible cards:");
             let line = read_line()?;
             if line.to_uppercase() == "ALL" {
                 break None;
@@ -583,7 +583,7 @@ fn main_wrapper() -> Option<()> {
         };
 
         let mut your_cards = vec![];
-        println!("Keep entering cards for you to draw from the deck, or just hit enter to run the optimizer.");
+        println!("Keep entering cards for the player to draw from the deck, or just hit enter to run the optimizer.");
         loop {
             let input = read_line()?;
             if input.is_empty() {
