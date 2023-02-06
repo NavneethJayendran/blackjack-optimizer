@@ -264,7 +264,7 @@ impl<'a> PlayerOptimizer<'a> {
             }
             your_hand.add_card((*card).into());
         }
-        match dealer_card {
+        let out = match dealer_card {
             Some(dealer_card) => {
                 let mut out: Vec<(BlackjackMove, f64)> = [Stay, Hit, Double]
                     .iter()
@@ -274,9 +274,6 @@ impl<'a> PlayerOptimizer<'a> {
                 out.sort_by(|(_, a), (_, b)| a.total_cmp(b).reverse());
 
                 self.cards.add(dealer_card);
-                for your_card in your_cards {
-                    self.cards.add(*your_card);
-                }
                 Ok(out)
             }
             None => {
@@ -288,7 +285,11 @@ impl<'a> PlayerOptimizer<'a> {
                 }
                 Ok(vec![(Optimal, total)])
             }
+        };
+        for your_card in your_cards {
+            self.cards.add(*your_card);
         }
+        out
     }
 
     fn expected_return(
