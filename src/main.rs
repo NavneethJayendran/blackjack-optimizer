@@ -24,6 +24,88 @@ pub struct BlackjackHand {
     last_two_cards: [Option<Card>; 2],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandValue {
+    Basic(u32),
+    Blackjack,
+}
+
+impl Ord for HandValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        use HandValue::*;
+        match (self, other) {
+            (Blackjack, Blackjack) => Equal,
+            (Blackjack, _) => Greater,
+            (_, Blackjack) => Less,
+            (Basic(x), Basic(y)) => {
+                if *x > 21 || *y > 21 {
+                    y.cmp(x)
+                } else {
+                    x.cmp(y)
+                }
+            }
+        }
+    }
+}
+
+impl PartialOrd for HandValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl HandValue {
+    fn better_values(&self) -> BetterHandValueIter {
+        BetterHandValueIter {
+            inclusive: false,
+            current_value: *self,
+        }
+    }
+
+    fn better_or_equal_values(&self) -> BetterHandValueIter {
+        BetterHandValueIter {
+            inclusive: true,
+            current_value: *self,
+        }
+    }
+
+    fn numeric(&self) -> u32 {
+        match self {
+            HandValue::Blackjack => 21,
+            HandValue::Basic(i) => *i,
+        }
+    }
+}
+
+struct BetterHandValueIter {
+    current_value: HandValue,
+    inclusive: bool,
+}
+
+impl Iterator for BetterHandValueIter {
+    type Item = HandValue;
+
+    fn next(&mut self) -> Option<HandValue> {
+        use HandValue::{Basic, Blackjack};
+        if self.inclusive {
+            self.inclusive = false;
+            return Some(self.current_value);
+        }
+        let next_value = match self.current_value {
+            Basic(x) if x < 21 => Some(Basic(x + 1)),
+            Basic(21) => Some(Blackjack),
+            Basic(22) => Some(Basic(0)),
+            Basic(x) => Some(Basic(x - 1)),
+            Blackjack => None,
+        };
+        if let Some(value) = next_value {
+            self.current_value = value;
+        }
+        next_value
+    }
+}
+
 impl BlackjackHand {
     fn add_card(&mut self, card: Card) -> BlackjackHand {
         self.number_of_cards += 1;
@@ -37,11 +119,17 @@ impl BlackjackHand {
         self.clone()
     }
 
-    fn best_value(&self) -> u32 {
+    fn best_value(&self) -> HandValue {
+        use HandValue::{Basic, Blackjack};
         let minimum_hand_value = self.non_ace_value + 1 * self.number_of_aces;
         let remainder_to_21 = max(0, 21 - (minimum_hand_value as i32)) as u32;
         let best_card_promotions_count = min(remainder_to_21 / 10, self.number_of_aces);
-        minimum_hand_value + 10 * best_card_promotions_count
+        let numeric = minimum_hand_value + 10 * best_card_promotions_count;
+        if numeric == 21 && self.number_of_cards == 2 {
+            Blackjack
+        } else {
+            Basic(numeric)
+        }
     }
 
     fn is_matching_pair(&self) -> bool {
@@ -53,7 +141,7 @@ impl BlackjackHand {
     }
 
     fn is_natural_21(&self) -> bool {
-        self.number_of_cards == 2 && self.best_value() == 21
+        self.best_value() == HandValue::Blackjack
     }
 }
 
@@ -111,7 +199,7 @@ impl<'a, 'b> BlackjackDealerHandView<'a, 'b> {
     pub fn draw(&mut self) -> Card {
         let card = self.deck[self.deck_index];
         self.deck_index += 1;
-        self.hand.add_card(card.into());
+        self.hand.add_card(card);
         card
     }
 
@@ -119,7 +207,7 @@ impl<'a, 'b> BlackjackDealerHandView<'a, 'b> {
         self.hand.number_of_aces > 0
     }
 
-    pub fn best_hand_value(&self) -> u32 {
+    pub fn best_hand_value(&self) -> HandValue {
         self.hand.best_value()
     }
 }
@@ -170,16 +258,29 @@ impl BlackjackDealerPredictiveModel {
             .collect()
     }
 
-    pub fn final_probability(&self, start_card: Card, final_best_value: u32) -> f64 {
-        if final_best_value >= 35 {
+    fn row_index_of_card(card: Card) -> usize {
+        card.value().map_or(0, |v| v - 1) as usize
+    }
+
+    fn column_index_of_hand_value(hand_value: HandValue) -> Option<usize> {
+        use HandValue::{Basic, Blackjack};
+        match hand_value {
+            Basic(i) if i <= 21 => Some(i as usize),
+            Basic(i) if i > 21 && i < 33 => Some(i as usize + 1),
+            Blackjack => Some(22),
+            _ => None,
+        }
+    }
+
+    pub fn final_probability(&self, start_card: Card, final_best_value: HandValue) -> f64 {
+        let column_index =
+            BlackjackDealerPredictiveModel::column_index_of_hand_value(final_best_value);
+        if column_index.is_none() {
             return 0.0;
         }
-        let final_hand = final_best_value as usize;
-        let row_index: usize = match start_card.value() {
-            None => 0,
-            Some(num) => (num as usize) - 1,
-        };
-        (self.hand_from_starting_card_simulated_counts[row_index][final_hand] as f64)
+        let column_index = column_index.unwrap();
+        let row_index = BlackjackDealerPredictiveModel::row_index_of_card(start_card);
+        (self.hand_from_starting_card_simulated_counts[row_index][column_index] as f64)
             / (self.row_totals[row_index] as f64)
     }
 
@@ -187,12 +288,16 @@ impl BlackjackDealerPredictiveModel {
         let mut hand = BlackjackDealerHandView::new(&mut self.rng, &mut self.deck);
         for _ in 0..iterations {
             let card = hand.draw();
-            let row_index = card.value().map_or(0, |v| v - 1) as usize;
+            let row_index = BlackjackDealerPredictiveModel::row_index_of_card(card);
             loop {
                 let best_hand_value = hand.best_hand_value();
-                if best_hand_value > 17 || best_hand_value == 17 && !hand.did_draw_ace() {
-                    self.hand_from_starting_card_simulated_counts[row_index]
-                        [best_hand_value as usize] += 1;
+                if best_hand_value.numeric() > 17
+                    || best_hand_value.numeric() == 17 && !hand.did_draw_ace()
+                {
+                    let column_index =
+                        BlackjackDealerPredictiveModel::column_index_of_hand_value(best_hand_value)
+                            .unwrap();
+                    self.hand_from_starting_card_simulated_counts[row_index][column_index] += 1;
                     self.row_totals[row_index] += 1;
                     break;
                 }
@@ -211,7 +316,7 @@ impl BlackjackDealerPredictiveModel {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-enum BlackjackMove {
+pub enum BlackjackMove {
     Stay,
     Hit,
     Double,
@@ -300,9 +405,10 @@ impl<'a> PlayerOptimizer<'a> {
         bj_move: BlackjackMove,
     ) -> (BlackjackMove, f64) {
         let your_best_value = your_hand.best_value();
-        if your_best_value > 21 {
+        if your_best_value <= HandValue::Basic(22) {
             return if your_hand.number_of_cards <= 3 && self.dual_bust_protection {
-                let odds_dealer_better_hand = (0..=your_best_value)
+                let odds_dealer_better_hand = your_best_value
+                    .better_or_equal_values()
                     .map(|finalh| self.dealer_model.final_probability(dealer_card, finalh))
                     .sum::<f64>();
                 (
@@ -350,7 +456,8 @@ impl<'a> PlayerOptimizer<'a> {
                 } else {
                     1.0
                 };
-                let prob_loss: f64 = (your_best_value + 1..=21)
+                let prob_loss: f64 = your_best_value
+                    .better_values()
                     .map(|final_dealer_best_value| {
                         self.dealer_model
                             .final_probability(dealer_card, final_dealer_best_value)
@@ -611,7 +718,13 @@ fn main_wrapper(config_file: Option<&str>) -> Option<()> {
                 .map(|(idx, (prob, rel_stderr))| {
                     format!(
                         "{}:{:.5}+-{:.5}",
-                        idx,
+                        if idx < 22 {
+                            idx.to_string()
+                        } else if idx == 22 {
+                            String::from("Blackjack")
+                        } else {
+                            (idx - 1).to_string()
+                        },
                         *prob as f64,
                         (*prob * (1.0 - *prob)).sqrt() * rel_stderr
                     )
@@ -662,17 +775,18 @@ fn main_wrapper(config_file: Option<&str>) -> Option<()> {
         {
             Ok([(BlackjackMove::Optimal, best_value)]) => {
                 println!(
-                    "Your expected return using the optimal strategy is {:.3}",
-                    best_value
+                    "Your expected return using the optimal strategy is {:.4}%",
+                    100.0 * best_value
                 )
             }
             Ok(move_values) => {
                 println!(
-                    "Your best move is {:?}, which has an expected return of {:.3}",
-                    move_values[0].0, move_values[0].1
+                    "Your best move is {:?}, which has an expected return of {:.4}%",
+                    move_values[0].0,
+                    100.0 * move_values[0].1
                 );
                 for (mv, ret) in &move_values[1..] {
-                    println!("{:?} has an expected return of {:.3}", *mv, *ret)
+                    println!("{:?} has an expected return of {:.4}%", *mv, 100.0 * (*ret));
                 }
             }
             Err(e) => {
@@ -706,20 +820,32 @@ mod tests {
 
     #[test]
     fn test_blackjack_hand() {
+        use HandValue::{Basic, Blackjack};
+
         let mut hand = BlackjackHand::default();
-        assert_eq!(0, hand.best_value());
+        assert_eq!(Basic(0), hand.best_value());
         hand.add_card(Card::Ace.into());
-        assert_eq!(11, hand.best_value());
+        assert_eq!(Basic(11), hand.best_value());
         hand.add_card(Card::Five.into());
-        assert_eq!(16, hand.best_value());
+        assert_eq!(Basic(16), hand.best_value());
         hand.add_card(Card::Ace.into());
-        assert_eq!(17, hand.best_value());
+        assert_eq!(Basic(17), hand.best_value());
         hand.add_card(Card::Ten.into());
-        assert_eq!(17, hand.best_value());
+        assert_eq!(Basic(17), hand.best_value());
         hand.add_card(Card::Four.into());
-        assert_eq!(21, hand.best_value());
+        assert_eq!(Basic(21), hand.best_value());
         hand.add_card(Card::Six.into());
-        assert_eq!(27, hand.best_value());
+        assert_eq!(Basic(27), hand.best_value());
+
+        let mut blackjack_hand1 = BlackjackHand::default();
+        blackjack_hand1.add_card(Card::Ace.into());
+        blackjack_hand1.add_card(Card::King.into());
+        assert_eq!(Blackjack, blackjack_hand1.best_value());
+
+        let mut blackjack_hand1 = BlackjackHand::default();
+        blackjack_hand1.add_card(Card::Ten.into());
+        blackjack_hand1.add_card(Card::Ace.into());
+        assert_eq!(Blackjack, blackjack_hand1.best_value());
     }
 
     #[test]
@@ -734,5 +860,18 @@ mod tests {
         assert_eq!(Card::Two, deck[1]);
         assert_eq!(Card::Three, deck[2]);
         assert_eq!(Card::Four, deck[3]);
+    }
+
+    #[test]
+    fn test_hand_value_iter() {
+        let mut hand_value_iter = HandValue::Basic(25).better_or_equal_values();
+        assert_eq!(Some(HandValue::Basic(25)), hand_value_iter.next());
+        assert_eq!(Some(HandValue::Basic(24)), hand_value_iter.next());
+        assert_eq!(Some(HandValue::Basic(23)), hand_value_iter.next());
+        assert_eq!(Some(HandValue::Basic(22)), hand_value_iter.next());
+        assert_eq!(Some(HandValue::Basic(0)), hand_value_iter.next());
+        assert_eq!(Some(HandValue::Basic(21)), hand_value_iter.nth(20));
+        assert_eq!(Some(HandValue::Blackjack), hand_value_iter.next());
+        assert_eq!(None, hand_value_iter.next());
     }
 }
