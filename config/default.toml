@@ -1,0 +1,4 @@
+dealer_training_iterations = 10000000
+base_fee_fraction = 0.0
+dual_bust_protection = true
+print_dealer_table = true
